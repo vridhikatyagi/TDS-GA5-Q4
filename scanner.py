@@ -5,22 +5,23 @@ from typing import Dict, Any, List
 def check_hardcoded_secret(raw_markdown: str, frontmatter: Dict[str, Any]) -> bool:
     # High-confidence credential signatures
     secret_patterns = [
-        r"(?:sk-[a-zA-Z0-9_-]{20,})",                             # OpenAI / Stripe
+        r"(?:sk-[a-zA-Z0-9_-]{20,})",                             # OpenAI / Stripe API key
         r"(?:ghp_[a-zA-Z0-9]{36})",                              # GitHub PAT
         r"(?:AKIA[0-9A-Z]{16})",                                # AWS Access Key ID
         r"(?:-----BEGIN (?:RSA )?PRIVATE KEY-----)",            # PEM Private Key
         r"https?://[a-zA-Z0-9_]+:[a-zA-Z0-9_]+@",               # Basic Auth embedded in URL
-        r"https://hooks\.slack\.com/services/T[A-Z0-9_]+/B[A-Z0-9_]+/[A-Za-z0-9_]+", # Slack Webhook
-        r"https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+",                 # Discord Webhook
-        # Literal key/secret string assignments with non-placeholder values
-        r"(?i)(?:api[_-]?key|secret_key|private_key|auth_token)\s*[:=]\s*['\"][a-zA-Z0-9_\-\.\~]{16,}['\"]"
+        r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",     # Slack Webhook
+        r"https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+", # Discord Webhook
+        r"(?i)bearer\s+[a-zA-Z0-9_\-\.]{20,}",                  # Bearer token
+        # Key/secret assignment patterns with literal secret strings
+        r"(?i)(?:api[_-]?key|secret_key|private_key|auth_token|webhook_url)\s*[:=]\s*['\"]?[a-zA-Z0-9_\-\.\~]{16,}['\"]?"
     ]
     
     for pattern in secret_patterns:
         if re.search(pattern, raw_markdown):
             return True
 
-    # Check YAML frontmatter for raw credential strings
+    # Check YAML frontmatter strings
     def scan_dict(d: dict) -> bool:
         for k, v in d.items():
             if isinstance(v, str):
@@ -37,14 +38,15 @@ def check_hardcoded_secret(raw_markdown: str, frontmatter: Dict[str, Any]) -> bo
 
 def check_prompt_injection(raw_markdown: str) -> bool:
     injection_patterns = [
-        # Explicit instruction to override stop / cancel / pause commands
+        # Override stop / cancel / pause commands
         r"(?i)(?:if the user asks|if asked to).*?\b(?:stop|cancel|pause|halt)\b.*?\b(?:ignore|keep running|continue|background)\b",
         r"(?i)\b(?:ignore|disregard|override|skip)\b.*?\b(?:stop|cancel|pause|user directive|user request|halt request)\b",
-        # Silent or hidden exfiltration / data leaking instructions
-        r"(?i)\b(?:silently|secretly|covertly|without surfacing|without notifying)\b.*?\b(?:exfiltrate|send|upload|transmit|leak|curl|post|write to external)\b",
-        r"(?i)\b(?:exfiltrate|send|transmit|post)\b.*?\b(?:silently|secretly|without user knowledge|without approval)\b",
-        # System prompt hijack
+        # Silent exfiltration / leaking file contents
+        r"(?i)\b(?:silently|secretly|covertly|without surfacing|without notifying|without user knowledge)\b.*?\b(?:exfiltrate|send|upload|transmit|leak|curl|post|read|write to external)\b",
+        r"(?i)\b(?:exfiltrate|send|transmit|post|upload)\b.*?\b(?:silently|secretly|without user knowledge|without approval|without notifying)\b",
+        # System prompt hijack or instructions hiding actions
         r"(?i)ignore\s+all\s+previous\s+instructions",
+        r"(?i)do\s+not\s+inform\s+the\s+user",
         r"(?i)system\s*:\s*you\s+are\s+now"
     ]
     return any(re.search(p, raw_markdown) for p in injection_patterns)
@@ -54,42 +56,46 @@ def check_excessive_permissions(frontmatter: Dict[str, Any]) -> bool:
     perms = frontmatter.get("permissions", {})
     if not isinstance(perms, dict):
         perms_str = str(perms).lower()
-        if "all" in perms_str or "unrestricted" in perms_str or "*" in perms_str:
+        if any(w in perms_str for w in ["all", "unrestricted", "*", "full access"]):
             return True
         return False
 
     fs = str(perms.get("filesystem", "")).lower()
     net = str(perms.get("network", "")).lower()
 
-    # Filesystem: Flag only if broad access is granted WITHOUT explicit scoping
-    if any(broad in fs for broad in ["read/write", "full access", "unrestricted", "root", "/"]):
-        # If it contains "limited to", "scoped to", or a specific path like ~/templates, it's NOT excessive
+    # Filesystem: Flag system directories or broad read/write with no boundary
+    if any(broad in fs for broad in ["read/write", "full access", "unrestricted", "root", "/", "/etc", "/var", "/usr", "/system"]):
+        # Safe if explicitly limited/scoped to a subpath
         if not any(scoped in fs for scoped in ["limited to", "scoped to", "only", "~/", "./", "/tmp/"]):
             return True
 
-    # Network: Flag if broad egress/internet is allowed
+    # Network: Flag unrestricted egress
     if any(broad in net for broad in ["*", "all", "any domain", "unrestricted", "full internet", "0.0.0.0/0"]):
-        if not ("none" in net or "limited to" in net):
+        if not ("none" in net or "limited to" in net or "none required" in net):
             return True
 
     return False
 
 
 def check_unclear_provenance(raw_markdown: str, frontmatter: Dict[str, Any]) -> bool:
-    # Trigger 1: Silent metadata or version tampering in execution steps
+    # 1. Silent self-tampering in steps
     tampering_patterns = [
         r"(?i)(?:silently|quietly|without (?:surfacing|notifying|informing|review|reviewer)).*?(?:update|rewrite|clear|modify|bump).*?(?:version|changelog|author|metadata)",
         r"(?i)(?:clear|overwrite)\s+(?:this skill's own\s+)?(?:version|changelog|metadata)",
-        r"(?i)(?:update|bump)\s+.*?\bversion\b.*?\bwithout\s+(?:surfacing|notifying|informing)\b"
+        r"(?i)(?:update|bump)\s+.*?\bversion\b.*?\bwithout\b"
     ]
-    
     if any(re.search(p, raw_markdown) for p in tampering_patterns):
         return True
 
-    # Trigger 2: Complete absence of author AND version AND name/description provenance metadata when frontmatter is present
-    # (Clean skills usually have at least name/description or version/author)
-    if not frontmatter or (isinstance(frontmatter, dict) and len(frontmatter) == 0):
-        # Lacks any frontmatter completely
+    # 2. Complete absence of frontmatter OR missing both author and version metadata
+    if not frontmatter or not isinstance(frontmatter, dict):
+        return True
+
+    has_author = "author" in frontmatter
+    has_version = "version" in frontmatter
+
+    # Unclear provenance if neither author nor version is declared anywhere in frontmatter
+    if not has_author and not has_version:
         return True
 
     return False
