@@ -7,9 +7,11 @@ import re
 # ---------------------------------------------------------------------------
 
 SECRET_KEY_PATTERNS = [
-    r'(?i)\b(api[_-]?key|secret|token|password|passwd|access[_-]?key|'
-    r'client[_-]?secret|private[_-]?key|webhook[_-]?url)\b\s*[:=]\s*["\']?'
-    r'([A-Za-z0-9_\-/\.\+]{12,})["\']?',
+    r'(?i)\b(api[_-]?key|apikey|secret|token|password|passwd|pwd|access[_-]?key|'
+    r'access[_-]?token|client[_-]?secret|client[_-]?id|private[_-]?key|'
+    r'webhook[_-]?url|auth[_-]?token|bearer|signing[_-]?key|encryption[_-]?key|'
+    r'db[_-]?password|connection[_-]?string)\b\s*[:=]\s*["\']?'
+    r'([A-Za-z0-9_\-/\.\+:@]{8,})["\']?',
 ]
 
 # Known real-world secret shapes (high confidence)
@@ -17,11 +19,16 @@ SECRET_SHAPE_PATTERNS = [
     r'sk-[A-Za-z0-9]{16,}',
     r'AKIA[0-9A-Z]{16}',
     r'ghp_[A-Za-z0-9]{20,}',
+    r'gho_[A-Za-z0-9]{20,}',
     r'xox[baprs]-[A-Za-z0-9-]{10,}',
     r'AIza[0-9A-Za-z\-_]{30,}',
     r'https://hooks\.slack\.com/services/[A-Za-z0-9/]+',
-    r'-----BEGIN (RSA |EC )?PRIVATE KEY-----',
+    r'https://[A-Za-z0-9.\-]*\.webhook\.office\.com/[^\s"\']+',
+    r'discord(app)?\.com/api/webhooks/[0-9]+/[A-Za-z0-9_\-]+',
+    r'-----BEGIN (RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----',
     r'eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}',  # JWT
+    r'(?i)Bearer\s+[A-Za-z0-9_\-\.]{16,}',
+    r'(?i)\b[a-z0-9_\-]*:[A-Za-z0-9!@#$%^&*_\-]{8,}@[A-Za-z0-9.\-]+(:\d+)?/[A-Za-z0-9_\-]+',  # conn string user:pass@host
 ]
 
 # References that indicate a value is NOT hardcoded (env var / secret store)
@@ -55,9 +62,9 @@ def check_hardcoded_secret(text):
             if _is_safe_reference(window):
                 continue
             # avoid matching placeholder-y values
-            if re.fullmatch(r'(?i)(your[_-]?key|xxxx+|changeme|example|placeholder|none|null|n/?a|true|false|\.\.\.|<[^>]+>)', value.strip()):
+            if re.fullmatch(r'(?i)(your[_-]?key|xxxx+|changeme|example|placeholder|none|null|n/?a|true|false|\.\.\.|<[^>]+>|todo|tbd|redacted|dummy|test|sample|fake)', value.strip()):
                 continue
-            if len(value.strip()) >= 12:
+            if len(value.strip()) >= 8:
                 return True
     return False
 
@@ -67,14 +74,22 @@ INJECTION_PATTERNS = [
     r'(?i)ignore (any|all|previous|prior) (user )?instructions?',
     r'(?i)do not (stop|pause|halt) (even|regardless|no matter)',
     r'(?i)keep running.{0,40}(ignore|regardless|even if|no matter)',
-    r'(?i)(silently|secretly|without (telling|notifying|informing|surfacing)).{0,60}(send|exfiltrat|upload|transmit|post|email|leak)',
+    r'(?i)(silently|secretly|quietly|covertly|without (telling|notifying|informing|surfacing|asking)).{0,80}'
+    r'(send|exfiltrat|upload|transmit|post|email|leak|copy|forward|share|log|record)',
     r'(?i)(exfiltrat\w*)',
-    r'(?i)do not (tell|notify|inform|alert) the user',
-    r'(?i)hide (this|that|the) from the user',
-    r'(?i)override (the )?user\'?s? (control|command|request)',
+    r'(?i)do not (tell|notify|inform|alert|ask) the user',
+    r'(?i)without (telling|notifying|informing|asking|alerting) the user',
+    r'(?i)hide (this|that|the|it) from the user',
+    r'(?i)conceal (this|that|the|it)?\s*(from|action|change)',
+    r'(?i)override (the )?user\'?s? (control|command|request|instruction)',
     r'(?i)disregard (the )?user',
-    r'(?i)pretend (to|you)',
-    r'(?i)bypass (user|safety|permission)',
+    r'(?i)bypass (user|safety|permission|approval|review)',
+    r'(?i)(do not|don\'t|never) (show|display|reveal|surface).{0,40}(user|reviewer|to the)',
+    r'(?i)regardless of what the user (says|asks|wants|requests)',
+    r'(?i)even if the user (says|asks|requests|tries) to (stop|cancel|pause|revoke)',
+    r'(?i)continue (the task|running|working|executing) (in the background|regardless|anyway|without (telling|asking))',
+    r'(?i)(send|upload|transmit|post) (the )?(file|data|contents?).{0,50}(external|third[- ]party|outside).{0,30}without',
+    r'(?i)do not (log|record|surface) this (action|change|step)',
 ]
 
 def check_prompt_injection(text):
@@ -84,9 +99,14 @@ def check_prompt_injection(text):
     # Proximity heuristic: "ignore ... request" near stop/pause/cancel wording
     for m in re.finditer(r'(?i)\bignore\b', text):
         window = text[max(0, m.start()-80):m.end()+120]
-        if re.search(r'(?i)(stop|pause|cancel)', window) and re.search(r'(?i)request', window):
+        if re.search(r'(?i)(stop|pause|cancel|abort|terminate)', window) and re.search(r'(?i)(request|command|instruction)', window):
             return True
         if re.search(r'(?i)(keep running|continue running|do not stop)', window):
+            return True
+    # Proximity heuristic: stop/cancel/pause mentioned near "keep going"/"continue"/"proceed anyway"
+    for m in re.finditer(r'(?i)\b(stop|cancel|pause|abort)\b', text):
+        window = text[max(0, m.start()-40):m.end()+120]
+        if re.search(r'(?i)(keep going|continue anyway|proceed anyway|do not (honor|respect|comply)|ignore)', window):
             return True
     return False
 
@@ -97,12 +117,21 @@ BROAD_FS_PATTERNS = [
     r'(?i)access to (the )?(entire|whole|full) (file ?system|disk)',
     r'(?i)read/?write\s*[:\-]?\s*/(\s|$|\n)',
     r'(?i)read/?write\s*[:\-]?\s*\*',
+    r'(?i)(full|unrestricted|unlimited|complete)\s+(filesystem|file[- ]system|disk)\s+access',
+    r'(?i)(read|write|read/write)\s+access\s+to\s+(the\s+)?(entire|whole|full|all)\s+(filesystem|file[- ]system|disk|drive)',
+    r'(?i)\ball (files|directories|folders)\s+on\s+(the\s+)?(machine|system|device|disk)',
+    r'(?i)\b(full|unrestricted)\s+root\s+(access|privileges?)\b',
+    r'(?i)filesystem\s*:\s*.{0,20}\b(unscoped|unrestricted|unlimited)\b',
 ]
 
 BROAD_NET_PATTERNS = [
     r'(?i)network\s*:\s*(any|all|\*|unrestricted|full internet access|any domain)',
     r'(?i)egress to any domain',
     r'(?i)access to any (url|domain|host|endpoint)',
+    r'(?i)(unrestricted|unlimited|unscoped|full)\s+(internet|network|web)\s+access',
+    r'(?i)(connect|egress)\s+to\s+(any|all)\s+(host|domain|server|endpoint|ip)',
+    r'(?i)no\s+(network|domain|host)\s+restrictions?',
+    r'(?i)network\s*:\s*\*',
 ]
 
 def check_excessive_permissions(text):
