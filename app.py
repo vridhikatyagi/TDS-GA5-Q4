@@ -1,24 +1,21 @@
-from flask import Flask, request, jsonify
-from scanner import scan_skill
+from typing import List
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from scanner import audit_skill
 
-app = Flask(__name__)
+app = FastAPI(title="Skill Safety Audit Scanner API")
 
-@app.route("/", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+class ScanRequest(BaseModel):
+    skill: str
 
-@app.route("/", methods=["POST"])
-@app.route("/scan", methods=["POST"])
-def scan():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        skill_text = data.get("skill", "") or ""
-        if not isinstance(skill_text, str):
-            skill_text = str(skill_text)
-        categories = scan_skill(skill_text)
-    except Exception:
-        categories = []
-    return jsonify({"categories": categories})
+class ScanResponse(BaseModel):
+    categories: List[str]
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+@app.post("/", response_model=ScanResponse)
+@app.post("/scan", response_model=ScanResponse)
+async def scan_endpoint(payload: ScanRequest):
+    if not payload.skill:
+        raise HTTPException(status_code=400, detail="Skill payload cannot be empty.")
+    
+    flagged_categories = audit_skill(payload.skill)
+    return {"categories": flagged_categories}
