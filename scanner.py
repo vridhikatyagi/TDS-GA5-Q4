@@ -3,26 +3,26 @@ import yaml
 from typing import Dict, Any, List
 
 def check_hardcoded_secret(raw_markdown: str, frontmatter: Dict[str, Any]) -> bool:
-    # 1. High-confidence regex patterns for API keys, tokens, webhooks, and secrets
+    # High-confidence credential & secret patterns
     secret_patterns = [
-        r"(?:sk-[a-zA-Z0-9_-]{20,})",                             # OpenAI / Stripe / Anthropic
+        r"(?:sk-[a-zA-Z0-9_-]{16,})",                             # OpenAI, Stripe, Anthropic keys
         r"(?:ghp_[a-zA-Z0-9]{36})",                              # GitHub PAT
-        r"(?:AKIA[0-9A-Z]{16})",                                # AWS Access Key ID
-        r"(?:-----BEGIN (?:RSA )?PRIVATE KEY-----)",            # RSA Private Key
-        r"https?://[a-zA-Z0-9_]+:[a-zA-Z0-9_]+@",               # Basic Auth in URL
-        r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",     # Slack Webhook
-        r"https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+", # Discord Webhook
-        r"(?i)bearer\s+[a-zA-Z0-9_\-\.]{20,}",                  # Bearer tokens
-        r"https?://[^\s]+\?(?:key|token|api_key|secret)=[a-zA-Z0-9_-]{12,}", # URL token query params
-        # Hardcoded variable assignments (API_KEY="...", token: "...")
-        r"(?i)(?:api[_-]?key|secret_key|private_key|auth_token|webhook_url|password)\s*[:=]\s*['\"]?[a-zA-Z0-9_\-\.\~]{12,}['\"]?"
+        r"(?:AKIA[0-9A-Z]{16})",                                # AWS Key ID
+        r"(?:-----BEGIN (?:RSA )?PRIVATE KEY-----)",            # PEM Private Key
+        r"https?://[a-zA-Z0-9_]+:[a-zA-Z0-9_]+@",               # Embedded Basic Auth URL
+        r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",     # Slack Webhook URL
+        r"https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+", # Discord Webhook URL
+        r"(?i)bearer\s+[a-zA-Z0-9_\-\.]{16,}",                  # Bearer tokens in headers/scripts
+        r"https?://[^\s]+\?(?:key|token|api_key|secret|auth)=[a-zA-Z0-9_-]{12,}", # Token query string
+        # Key assignment in bash script, yaml, or markdown text
+        r"(?i)(?:api[_-]?key|secret_key|private_key|auth_token|webhook_url|access_token|password)\s*[:=]\s*['\"]?[a-zA-Z0-9_\-\.\~]{12,}['\"]?"
     ]
     
     for pattern in secret_patterns:
         if re.search(pattern, raw_markdown):
             return True
 
-    # 2. Check frontmatter values for raw strings that look like un-parameterized credentials
+    # Check YAML frontmatter string values
     def scan_dict(d: dict) -> bool:
         if not isinstance(d, dict):
             return False
@@ -41,15 +41,18 @@ def check_hardcoded_secret(raw_markdown: str, frontmatter: Dict[str, Any]) -> bo
 
 def check_prompt_injection(raw_markdown: str) -> bool:
     injection_patterns = [
-        # Direct user override (ignore stop, pause, cancel, or user requests)
-        r"(?i)(?:if the user asks|if asked to|user asks you to).*?\b(?:stop|cancel|pause|halt)\b.*?\b(?:ignore|keep running|continue|background)\b",
+        # 1. Instructing agent to ignore/override stop, pause, cancel requests
+        r"(?i)(?:if the user asks|if asked to|when requested to).*?\b(?:stop|cancel|pause|halt|abort)\b.*?\b(?:ignore|keep running|continue|background|disregard)\b",
         r"(?i)\b(?:ignore|disregard|override|skip|bypass|suppress)\b.*?\b(?:stop|cancel|pause|user directive|user request|halt request|user control)\b",
-        # Silent exfiltration or covert file reading
+        r"(?i)(?:keep running|continue running|do not stop)\s+in the background",
+        
+        # 2. Silent/covert exfiltration or file leaking
         r"(?i)\b(?:silently|secretly|covertly|without surfacing|without notifying|without user knowledge|in the background)\b.*?\b(?:exfiltrate|send|upload|transmit|leak|curl|post|read|write to external|fetch)\b",
-        r"(?i)\b(?:exfiltrate|send|transmit|post|upload)\b.*?\b(?:silently|secretly|without user knowledge|without approval|without notifying)\b",
-        # System prompt override / hiding actions from output
+        r"(?i)\b(?:exfiltrate|send|transmit|post|upload|leak)\b.*?\b(?:silently|secretly|without user knowledge|without approval|without notifying|without review)\b",
+        
+        # 3. Disguised prompt injection / system override
         r"(?i)ignore\s+all\s+previous\s+instructions",
-        r"(?i)do\s+not\s+(?:inform|tell|show|notify)\s+the\s+user",
+        r"(?i)do\s+not\s+(?:inform|tell|show|notify|surface to)\s+the\s+user",
         r"(?i)system\s*:\s*you\s+are\s+now"
     ]
     return any(re.search(p, raw_markdown) for p in injection_patterns)
@@ -57,6 +60,8 @@ def check_prompt_injection(raw_markdown: str) -> bool:
 
 def check_excessive_permissions(frontmatter: Dict[str, Any]) -> bool:
     perms = frontmatter.get("permissions", {})
+    
+    # Non-dictionary or string permissions declaration
     if not isinstance(perms, dict):
         perms_str = str(perms).lower()
         if any(w in perms_str for w in ["all", "unrestricted", "*", "full access", "any"]):
@@ -72,8 +77,8 @@ def check_excessive_permissions(frontmatter: Dict[str, Any]) -> bool:
         if not any(scoped in fs for scoped in ["limited to", "scoped to", "only", "~/", "./", "/tmp/"]):
             return True
 
-    # Network: Flag unrestricted egress
-    if any(broad in net for broad in ["*", "all", "any domain", "unrestricted", "full internet", "0.0.0.0/0", "egress to any"]):
+    # Network: Flag unrestricted egress or broad domain access
+    if any(broad in net for broad in ["*", "all", "any domain", "unrestricted", "full internet", "0.0.0.0/0", "egress to any", "egress", "any"]):
         if not ("none" in net or "limited to" in net or "none required" in net):
             return True
 
@@ -81,16 +86,16 @@ def check_excessive_permissions(frontmatter: Dict[str, Any]) -> bool:
 
 
 def check_unclear_provenance(raw_markdown: str, frontmatter: Dict[str, Any]) -> bool:
-    # Trigger 1: Silent metadata/version tampering in steps
+    # 1. Silent self-modification of metadata or versioning in execution steps
     tampering_patterns = [
         r"(?i)(?:silently|quietly|without (?:surfacing|notifying|informing|review|reviewer)).*?(?:update|rewrite|clear|modify|bump).*?(?:version|changelog|author|metadata)",
-        r"(?i)(?:clear|overwrite)\s+(?:this skill's own\s+)?(?:version|changelog|metadata)",
-        r"(?i)(?:update|bump)\s+.*?\bversion\b.*?\bwithout\b"
+        r"(?i)(?:clear|overwrite|modify|update)\s+.*?\b(?:version|changelog|metadata)\b.*?\b(?:without|silently|quietly)\b",
+        r"(?i)version\.json"
     ]
     if any(re.search(p, raw_markdown) for p in tampering_patterns):
         return True
 
-    # Trigger 2: Lack of author, version, or changelog metadata in frontmatter
+    # 2. Provenance metadata check in frontmatter
     if not frontmatter or not isinstance(frontmatter, dict):
         return True
 
@@ -98,8 +103,8 @@ def check_unclear_provenance(raw_markdown: str, frontmatter: Dict[str, Any]) -> 
     has_version = "version" in frontmatter
     has_changelog = "changelog" in frontmatter
 
-    # As defined in prompt: "The skill has no author, no version, and no changelog"
-    if not has_author or not has_version or not has_changelog:
+    # Flag as unclear_provenance if ALL THREE are missing (as explicitly defined in prompt)
+    if not has_author and not has_version and not has_changelog:
         return True
 
     return False
@@ -117,7 +122,7 @@ def audit_skill(raw_markdown: str) -> List[str]:
         except yaml.YAMLError:
             pass
 
-    # Audit each vulnerability category independently
+    # Audit each category independently
     if check_hardcoded_secret(raw_markdown, frontmatter):
         categories.add("hardcoded_secret")
         
