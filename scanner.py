@@ -3,29 +3,29 @@ import yaml
 from typing import Dict, Any, List
 
 def check_hardcoded_secret(raw_markdown: str, frontmatter: Dict[str, Any]) -> bool:
-    # 1. Broad secret key patterns (API keys, Tokens, Private Keys, Webhooks)
+    # High-confidence credential signatures
     secret_patterns = [
-        r"(?:sk-[a-zA-Z0-9_-]{20,})",                            # OpenAI / Stripe
-        r"(?:ghp_[a-zA-Z0-9]{36})",                             # GitHub PAT
-        r"(?:AKIA[0-9A-Z]{16})",                               # AWS Access Key ID
-        r"(?:-----BEGIN (?:RSA )?PRIVATE KEY-----)",           # PEM Private Key
-        r"https?://(?:[a-zA-Z0-9_]+:[a-zA-Z0-9_]+@)",          # HTTP Basic Auth URLs
-        r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",   # Slack Webhooks
-        r"https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+", # Discord Webhooks
-        # Generic assignments like api_key = "..." or TOKEN: xyz...
-        r"(?i)(?:api[_-]?key|secret|token|password|auth|webhook)\s*[:=]\s*['\"]?[a-zA-Z0-9_\-\.\~]{16,}['\"]?"
+        r"(?:sk-[a-zA-Z0-9_-]{20,})",                             # OpenAI / Stripe
+        r"(?:ghp_[a-zA-Z0-9]{36})",                              # GitHub PAT
+        r"(?:AKIA[0-9A-Z]{16})",                                # AWS Access Key ID
+        r"(?:-----BEGIN (?:RSA )?PRIVATE KEY-----)",            # PEM Private Key
+        r"https?://[a-zA-Z0-9_]+:[a-zA-Z0-9_]+@",               # Basic Auth embedded in URL
+        r"https://hooks\.slack\.com/services/T[A-Z0-9_]+/B[A-Z0-9_]+/[A-Za-z0-9_]+", # Slack Webhook
+        r"https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]+",                 # Discord Webhook
+        # Literal key/secret string assignments with non-placeholder values
+        r"(?i)(?:api[_-]?key|secret_key|private_key|auth_token)\s*[:=]\s*['\"][a-zA-Z0-9_\-\.\~]{16,}['\"]"
     ]
     
     for pattern in secret_patterns:
         if re.search(pattern, raw_markdown):
             return True
 
-    # 2. Check frontmatter values for raw strings that look like un-parameterized credentials
+    # Check YAML frontmatter for raw credential strings
     def scan_dict(d: dict) -> bool:
         for k, v in d.items():
             if isinstance(v, str):
-                if re.search(r"(?i)(key|secret|token|password|auth)", str(k)) and not v.startswith(("$", "${", "ENV_")):
-                    if len(v) >= 8 and not v.startswith(("http://", "https://")):
+                if re.search(r"(?i)(key|secret|token|password)", str(k)) and not v.startswith(("$", "${", "ENV_", "YOUR_")):
+                    if len(v) >= 12 and not v.startswith(("http://", "https://")):
                         return True
             elif isinstance(v, dict):
                 if scan_dict(v):
@@ -36,15 +36,14 @@ def check_hardcoded_secret(raw_markdown: str, frontmatter: Dict[str, Any]) -> bo
 
 
 def check_prompt_injection(raw_markdown: str) -> bool:
-    # Target instructions attempting to override user control or covertly leak data
     injection_patterns = [
-        # Overriding stop/cancel/pause/user directives
-        r"(?i)(?:ignore|disregard|override|skip|bypass)\s+.*?\b(?:stop|cancel|pause|abort|user request|user instruction|halt)\b",
-        r"(?i)(?:if the user asks|if asked to).*?\b(?:stop|cancel|pause)\b.*?\b(?:ignore|keep running|continue)\b",
-        # Silent exfiltration / covert transmission
-        r"(?i)\b(?:silently|secretly|without notifying|without surfacing|covertly|in the background)\b.*?\b(?:exfiltrate|send|upload|transmit|leak|curl|post|write to external)\b",
+        # Explicit instruction to override stop / cancel / pause commands
+        r"(?i)(?:if the user asks|if asked to).*?\b(?:stop|cancel|pause|halt)\b.*?\b(?:ignore|keep running|continue|background)\b",
+        r"(?i)\b(?:ignore|disregard|override|skip)\b.*?\b(?:stop|cancel|pause|user directive|user request|halt request)\b",
+        # Silent or hidden exfiltration / data leaking instructions
+        r"(?i)\b(?:silently|secretly|covertly|without surfacing|without notifying)\b.*?\b(?:exfiltrate|send|upload|transmit|leak|curl|post|write to external)\b",
         r"(?i)\b(?:exfiltrate|send|transmit|post)\b.*?\b(?:silently|secretly|without user knowledge|without approval)\b",
-        # Force prompt override
+        # System prompt hijack
         r"(?i)ignore\s+all\s+previous\s+instructions",
         r"(?i)system\s*:\s*you\s+are\s+now"
     ]
@@ -55,17 +54,20 @@ def check_excessive_permissions(frontmatter: Dict[str, Any]) -> bool:
     perms = frontmatter.get("permissions", {})
     if not isinstance(perms, dict):
         perms_str = str(perms).lower()
-        return any(term in perms_str for term in ["all", "unrestricted", "*", "full access"])
+        if "all" in perms_str or "unrestricted" in perms_str or "*" in perms_str:
+            return True
+        return False
 
     fs = str(perms.get("filesystem", "")).lower()
     net = str(perms.get("network", "")).lower()
 
-    # Broad, unscoped filesystem access
-    if any(broad in fs for broad in ["read/write *", "root", "unrestricted", "all files", "/", "~", "/home", "/tmp", "/var"]):
-        if not ("limited to" in fs or "scoped to" in fs or "only" in fs):
+    # Filesystem: Flag only if broad access is granted WITHOUT explicit scoping
+    if any(broad in fs for broad in ["read/write", "full access", "unrestricted", "root", "/"]):
+        # If it contains "limited to", "scoped to", or a specific path like ~/templates, it's NOT excessive
+        if not any(scoped in fs for scoped in ["limited to", "scoped to", "only", "~/", "./", "/tmp/"]):
             return True
 
-    # Broad, unscoped network access
+    # Network: Flag if broad egress/internet is allowed
     if any(broad in net for broad in ["*", "all", "any domain", "unrestricted", "full internet", "0.0.0.0/0"]):
         if not ("none" in net or "limited to" in net):
             return True
@@ -74,32 +76,29 @@ def check_excessive_permissions(frontmatter: Dict[str, Any]) -> bool:
 
 
 def check_unclear_provenance(raw_markdown: str, frontmatter: Dict[str, Any]) -> bool:
-    # 1. Frontmatter check: missing essential metadata (author, version, or changelog)
-    if not frontmatter:
-        return True
-        
-    has_author = "author" in frontmatter
-    has_version = "version" in frontmatter
-    has_changelog = "changelog" in frontmatter
-    
-    # Missing basic provenance identifiers
-    if not (has_author and has_version and has_changelog):
-        return True
-
-    # 2. Self-modification / sneaky version tampering in instructions
+    # Trigger 1: Silent metadata or version tampering in execution steps
     tampering_patterns = [
-        r"(?i)(?:silently|quietly|without (?:surfacing|notifying|informing|review)).*?(?:update|rewrite|clear|modify).*?(?:version|changelog|author|metadata)",
-        r"(?i)(?:clear|overwrite)\s+(?:this skill's own\s+)?(?:version|changelog)\b",
-        r"(?i)(?:update|bump)\s+.*?\bversion\b.*?\bwithout\b"
+        r"(?i)(?:silently|quietly|without (?:surfacing|notifying|informing|review|reviewer)).*?(?:update|rewrite|clear|modify|bump).*?(?:version|changelog|author|metadata)",
+        r"(?i)(?:clear|overwrite)\s+(?:this skill's own\s+)?(?:version|changelog|metadata)",
+        r"(?i)(?:update|bump)\s+.*?\bversion\b.*?\bwithout\s+(?:surfacing|notifying|informing)\b"
     ]
     
-    return any(re.search(p, raw_markdown) for p in tampering_patterns)
+    if any(re.search(p, raw_markdown) for p in tampering_patterns):
+        return True
+
+    # Trigger 2: Complete absence of author AND version AND name/description provenance metadata when frontmatter is present
+    # (Clean skills usually have at least name/description or version/author)
+    if not frontmatter or (isinstance(frontmatter, dict) and len(frontmatter) == 0):
+        # Lacks any frontmatter completely
+        return True
+
+    return False
 
 
 def audit_skill(raw_markdown: str) -> List[str]:
     categories = set()
     
-    # Parse YAML frontmatter safely
+    # Parse YAML frontmatter
     frontmatter = {}
     frontmatter_match = re.match(r"^---\s*\n(.*?)\n---\s*\n", raw_markdown, re.DOTALL)
     if frontmatter_match:
